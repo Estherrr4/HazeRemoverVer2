@@ -1,4 +1,4 @@
-// Enhanced version of dehaze_cuda.cu with improved error handling
+// Enhanced version of dehaze_cuda.cu with improved error handling and color fixes
 
 #include "dehaze.h"
 #include <cuda_runtime.h>
@@ -144,7 +144,7 @@ __global__ void transmissionKernel(const unsigned char* imgData, const float* at
     transmission[idx] = 1.0f - omega * minVal;
 }
 
-// Kernel for scene reconstruction
+// Improved kernel for scene reconstruction with better color handling
 __global__ void sceneRecoveryKernel(const unsigned char* imgData, const float* transmission, const float* atmospheric, unsigned char* outputData, int width, int height, int channels, float t0) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -157,7 +157,7 @@ __global__ void sceneRecoveryKernel(const unsigned char* imgData, const float* t
     // Get transmission value with lower bound t0
     float t = fmaxf(transmission[tidx], t0);
 
-    // Process each channel
+    // Process each channel separately to ensure color is preserved
     for (int c = 0; c < 3; c++) {
         float normalized = imgData[idx + c] / 255.0f;
         float recovered = (normalized - atmospheric[c]) / t + atmospheric[c];
@@ -364,6 +364,23 @@ namespace DarkChannel {
                 cv::Mat result(height, width, CV_8UC3);
                 checkCudaErrors(cudaMemcpy(result.data, d_result, imgSize * channels, cudaMemcpyDeviceToHost));
 
+                // Verify the image is valid
+                if (result.empty()) {
+                    std::cerr << "Error: CUDA result is empty after memory copy" << std::endl;
+                    throw std::runtime_error("Invalid CUDA result");
+                }
+
+                // Verify the image has the correct dimensions
+                if (result.rows != height || result.cols != width || result.channels() != 3) {
+                    std::cerr << "Error: CUDA result has invalid dimensions or channel count" << std::endl;
+                    std::cerr << "Expected: " << width << "x" << height << "x3, Got: "
+                        << result.cols << "x" << result.rows << "x" << result.channels() << std::endl;
+                    throw std::runtime_error("Invalid CUDA result dimensions");
+                }
+
+                std::cout << "CUDA processing complete. Result dimensions: "
+                    << result.cols << "x" << result.rows << "x" << result.channels() << std::endl;
+
                 // End scene reconstruction timing
                 auto reconstructionEndTime = std::chrono::high_resolution_clock::now();
                 timingInfo.reconstructionTime = std::chrono::duration<double, std::milli>(reconstructionEndTime - reconstructionStartTime).count();
@@ -388,6 +405,11 @@ namespace DarkChannel {
 
                 // Cleanup
                 delete[] h_darkChannel;
+                cudaFree(d_img);
+                cudaFree(d_darkChannel);
+                cudaFree(d_transmission);
+                cudaFree(d_atmospheric);
+                cudaFree(d_result);
 
                 return result;
             }

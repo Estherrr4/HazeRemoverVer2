@@ -51,8 +51,8 @@ namespace DarkChannel {
             int patch_radius = 7;
             cv::Mat darkchannel = cv::Mat::zeros(img_double.rows, img_double.cols, CV_64F);
 
-            // Use OpenMP vectorization without thread parallelism
-#pragma omp parallel for collapse(2)
+            // Use OpenMP for parallelism - FIXED: removed collapse clause
+#pragma omp parallel for
             for (int i = 0; i < darkchannel.rows; i++) {
                 for (int j = 0; j < darkchannel.cols; j++) {
                     int r_start = std::max(0, i - patch_radius);
@@ -89,7 +89,6 @@ namespace DarkChannel {
             V.reserve(pixels);
             int k = 0;
 
-            // Use vectorization
             for (int i = 0; i < darkchannel.rows; i++) {
                 for (int j = 0; j < darkchannel.cols; j++) {
                     V.emplace_back(darkchannel.at<double>(i, j), k);
@@ -103,19 +102,18 @@ namespace DarkChannel {
 
             double atmospheric_light[] = { 0, 0, 0 };
 
-            // Vectorizable loop
-            #pragma omp parallel for 
             for (k = 0; k < num; k++) {
                 int r = V[k].second / darkchannel.cols;
                 int c = V[k].second % darkchannel.cols;
                 const cv::Vec3d& val = img_double.at<cv::Vec3d>(r, c);
-                #pragma omp critical
-                {
+
+                // Use atomic operations for thread safety
+#pragma omp atomic
                 atmospheric_light[0] += val[0];
+#pragma omp atomic
                 atmospheric_light[1] += val[1];
+#pragma omp atomic
                 atmospheric_light[2] += val[2];
-                }
-                
             }
 
             atmospheric_light[0] /= num;
@@ -140,7 +138,7 @@ namespace DarkChannel {
             cv::Mat channels[3];
             cv::split(img_double, channels);
 
-            // Vectorizable operations
+            // Process each channel in parallel
 #pragma omp parallel for
             for (k = 0; k < 3; k++) {
                 channels[k] /= atmospheric_light[k];
@@ -152,8 +150,8 @@ namespace DarkChannel {
             // Get dark channel of normalized image
             cv::Mat temp_dark = cv::Mat::zeros(temp.rows, temp.cols, CV_64F);
 
-            // Use vectorization
-#pragma omp parallel for collapse(2)
+            // Parallelize this computation - FIXED: removed collapse clause
+#pragma omp parallel for
             for (int i = 0; i < temp.rows; i++) {
                 for (int j = 0; j < temp.cols; j++) {
                     int r_start = std::max(0, i - patch_radius);
@@ -176,7 +174,7 @@ namespace DarkChannel {
             }
 
             // Get transmission
-            cv::Mat transmission = 1 - omega * temp_dark;
+            cv::Mat transmission = 1.0 - omega * temp_dark;
 
             // End timing for transmission estimation
             auto transmissionEndTime = std::chrono::high_resolution_clock::now();
@@ -197,30 +195,45 @@ namespace DarkChannel {
 
             // Ensure minimum transmission value to preserve details in dark regions
             double t0 = 0.1;
+
+            // Get the original image channels again since we modified them earlier
             cv::split(img_double, channels);
+
             cv::Mat trans_;
             cv::max(transmission, t0, trans_);
 
-            cv::Mat temp_;
+            // Process channels separately - FIX FOR COLOR ISSUE
+            cv::Mat result_channels[3];
 
-            // Vectorizable operations
-            #pragma omp parallel for
+            // Process each channel in parallel
+#pragma omp parallel for
             for (k = 0; k < 3; k++) {
-                cv::divide((channels[k] - atmospheric_light[k]), trans_, temp_);
-                channels[k] = atmospheric_light[k] + temp_;
+                result_channels[k] = cv::Mat(channels[k].size(), CV_64F);
+
+                for (int i = 0; i < channels[k].rows; i++) {
+                    for (int j = 0; j < channels[k].cols; j++) {
+                        double val = channels[k].at<double>(i, j);
+                        double t = trans_.at<double>(i, j);
+                        // Apply dehaze formula: J = (I-A)/t + A
+                        result_channels[k].at<double>(i, j) = ((val - atmospheric_light[k]) / t) + atmospheric_light[k];
+                    }
+                }
             }
 
             // Merge channels and convert back to 8-bit
             cv::Mat res;
-            cv::merge(channels, 3, res);
+            cv::merge(result_channels, 3, res);
 
             // Normalize result
-            double maxv;
-            cv::minMaxLoc(res, nullptr, &maxv, nullptr, nullptr);
-            if (maxv > 0) {
-                res /= maxv;
+            double minVal, maxVal;
+            cv::minMaxLoc(res, &minVal, &maxVal);
+            if (maxVal > minVal) {
+                // Normalize to 0-1 range
+                res = (res - minVal) / (maxVal - minVal);
             }
-            res *= 255;
+
+            // Convert to 8-bit
+            res *= 255.0;
             res.convertTo(res, CV_8UC3);
 
             // End timing for scene reconstruction
@@ -260,51 +273,7 @@ namespace DarkChannel {
         }
     }
 
-    /*extern bool isCudaAvailable() {
-        #ifdef CUDA_ENABLED
-        try {
-            int deviceCount = 0;
-            cudaError_t error = cudaGetDeviceCount(&deviceCount);
-
-            if (error != cudaSuccess) {
-                std::cerr << "CUDA device check failed: " << cudaGetErrorString(error) << std::endl;
-                return false;
-            }
-
-            if (deviceCount == 0) {
-                std::cerr << "No CUDA devices found on this system." << std::endl;
-                return false;
-            }
-
-            // Additional check: verify device capabilities
-            cudaDeviceProp deviceProp;
-            error = cudaGetDeviceProperties(&deviceProp, 0);
-
-            if (error != cudaSuccess) {
-                std::cerr << "Failed to get CUDA device properties: " << cudaGetErrorString(error) << std::endl;
-                return false;
-            }
-
-            // Check for compute capability (minimum 3.0 required)
-            if (deviceProp.major < 3) {
-                std::cerr << "CUDA device has compute capability "
-                    << deviceProp.major << "." << deviceProp.minor
-                    << ", but 3.0 or higher is required." << std::endl;
-                return false;
-            }
-
-            std::cout << "CUDA device available: " << deviceProp.name << " (Compute "
-                << deviceProp.major << "." << deviceProp.minor << ")" << std::endl;
-
-            return true;
-        }
-        catch (const std::exception& e) {
-            std::cerr << "Exception checking CUDA availability: " << e.what() << std::endl;
-            return false;
-        }
-        #else
-        std::cerr << "CUDA support not compiled into this build." << std::endl;
-        return false;
-        #endif
-    }*/
+    // Only declare isCudaAvailable, don't define it
+    // This function is defined in dehaze_cuda.cu
+    bool isCudaAvailable();
 }

@@ -17,7 +17,6 @@
 #include <conio.h> // For _getch() on Windows
 #endif
 
-
 inline int get_max(int a, int b) {
     return (a > b) ? a : b;
 }
@@ -68,6 +67,23 @@ std::string getImageFile() {
 #endif
 }
 
+// Function to resize large images while maintaining aspect ratio
+cv::Mat resizeImageIfTooLarge(const cv::Mat& img, int maxDimension = 1200) {
+    // Check if the image is too large
+    if (img.cols > maxDimension || img.rows > maxDimension) {
+        cv::Mat resized;
+        double scale = (double)maxDimension / (img.cols > img.rows ? img.cols : img.rows);
+        int newWidth = static_cast<int>(img.cols * scale);
+        int newHeight = static_cast<int>(img.rows * scale);
+
+        cv::resize(img, resized, cv::Size(newWidth, newHeight), 0, 0, cv::INTER_AREA);
+        std::cout << "Image resized from " << img.cols << "x" << img.rows
+            << " to " << resized.cols << "x" << resized.rows << std::endl;
+        return resized;
+    }
+    return img;
+}
+
 // Function to process a single image
 bool processImage(const std::string& img_path, const std::string& project_path) {
     try {
@@ -78,8 +94,8 @@ bool processImage(const std::string& img_path, const std::string& project_path) 
         std::cout << "Processing image: " << normalized_path << std::endl;
 
         // Load image
-        cv::Mat img = cv::imread(normalized_path);
-        if (img.empty()) {
+        cv::Mat original_img = cv::imread(normalized_path);
+        if (original_img.empty()) {
             std::cerr << "Error: Failed to load image: " << normalized_path << std::endl;
             waitForKeyPress();
             return false;
@@ -89,7 +105,21 @@ bool processImage(const std::string& img_path, const std::string& project_path) 
         size_t pos = normalized_path.find_last_of('/');
         std::string img_name = (pos != std::string::npos) ? normalized_path.substr(pos + 1) : normalized_path;
 
-        std::cout << "Image loaded successfully. Size: " << img.cols << "x" << img.rows << std::endl;
+        std::cout << "Image loaded successfully. Original size: " << original_img.cols << "x" << original_img.rows << std::endl;
+
+        // Resize large images for faster processing
+        cv::Mat img = resizeImageIfTooLarge(original_img, 1200);
+
+        // Save original and resized version of input image for reference
+        std::string original_path = project_path + "original_" + img_name;
+        cv::imwrite(original_path, original_img);
+
+        if (img.data != original_img.data) {
+            std::string resized_input_path = project_path + "resized_input_" + img_name;
+            cv::imwrite(resized_input_path, img);
+            std::cout << "Original image saved as: " << original_path << std::endl;
+            std::cout << "Resized input saved as: " << resized_input_path << std::endl;
+        }
 
         // Process with serial version
         std::cout << "\nRunning serial version..." << std::endl;
@@ -114,6 +144,12 @@ bool processImage(const std::string& img_path, const std::string& project_path) 
             try {
                 cuda_result = DarkChannel::dehaze_cuda(img);
                 cuda_timing = DarkChannel::getLastTimingInfo();
+
+                // Verify the CUDA result is valid
+                if (cuda_result.empty()) {
+                    std::cerr << "Warning: CUDA result is empty" << std::endl;
+                    cuda_available = false;
+                }
             }
             catch (const std::exception& e) {
                 std::cerr << "CUDA processing failed: " << e.what() << std::endl;
@@ -271,28 +307,84 @@ bool processImage(const std::string& img_path, const std::string& project_path) 
             std::cout << "  CUDA: " << cuda_output_path << std::endl;
         }
 
+        // Create a smaller version for display if the image is very large
+        cv::Mat display_img = img;
+        cv::Mat display_serial = serial_result;
+        cv::Mat display_openmp = openmp_result;
+        cv::Mat display_cuda;
+
+        // Resize large images for display
+        int maxDisplayDimension = 800;
+        if (img.cols > maxDisplayDimension || img.rows > maxDisplayDimension) {
+            double scale = (double)maxDisplayDimension / (img.cols > img.rows ? img.cols : img.rows);
+            int newWidth = static_cast<int>(img.cols * scale);
+            int newHeight = static_cast<int>(img.rows * scale);
+
+            cv::resize(img, display_img, cv::Size(newWidth, newHeight), 0, 0, cv::INTER_AREA);
+            cv::resize(serial_result, display_serial, cv::Size(newWidth, newHeight), 0, 0, cv::INTER_AREA);
+            cv::resize(openmp_result, display_openmp, cv::Size(newWidth, newHeight), 0, 0, cv::INTER_AREA);
+
+            if (cuda_available) {
+                cv::resize(cuda_result, display_cuda, cv::Size(newWidth, newHeight), 0, 0, cv::INTER_AREA);
+            }
+
+            std::cout << "Images resized for display to " << newWidth << "x" << newHeight << std::endl;
+        }
+        else if (cuda_available) {
+            display_cuda = cuda_result;
+        }
+
         // Create named windows with the WINDOW_NORMAL flag to allow resizing
         cv::namedWindow("Original", cv::WINDOW_NORMAL);
         cv::namedWindow("Serial Result", cv::WINDOW_NORMAL);
         cv::namedWindow("OpenMP Result", cv::WINDOW_NORMAL);
+
+        // Resize windows for better viewing - based on the display image size
+        int windowWidth = display_img.cols;
+        int windowHeight = display_img.rows;
+
+        cv::resizeWindow("Original", windowWidth, windowHeight);
+        cv::resizeWindow("Serial Result", windowWidth, windowHeight);
+        cv::resizeWindow("OpenMP Result", windowWidth, windowHeight);
+
         if (cuda_available) {
             cv::namedWindow("CUDA Result", cv::WINDOW_NORMAL);
+            cv::resizeWindow("CUDA Result", windowWidth, windowHeight);
         }
 
-        // Position the windows side by side
-        cv::moveWindow("Original", 50, 50);
-        cv::moveWindow("Serial Result", 50 + img.cols + 20, 50);
-        cv::moveWindow("OpenMP Result", 50 + 2 * (img.cols + 20), 50);
+        // Calculate window positions to avoid overlap and ensure visibility
+        int screenWidth = 1920;  // Assuming a standard screen width
+        int windowSpacing = 20;
+        int windowsPerRow = 2;
+        int windowX, windowY;
+
+        // Position windows in a grid pattern
+        windowX = 50;
+        windowY = 50;
+        cv::moveWindow("Original", windowX, windowY);
+
+        windowX = 50 + windowWidth + windowSpacing;
+        cv::moveWindow("Serial Result", windowX, windowY);
+
+        windowX = 50;
+        windowY = 50 + windowHeight + windowSpacing;
+        cv::moveWindow("OpenMP Result", windowX, windowY);
+
         if (cuda_available) {
-            cv::moveWindow("CUDA Result", 50 + 3 * (img.cols + 20), 50);
+            windowX = 50 + windowWidth + windowSpacing;
+            windowY = 50 + windowHeight + windowSpacing;
+            cv::moveWindow("CUDA Result", windowX, windowY);
         }
 
         // Display the results
-        cv::imshow("Original", img);
-        cv::imshow("Serial Result", serial_result);
-        cv::imshow("OpenMP Result", openmp_result);
+        cv::imshow("Original", display_img);
+        cv::imshow("Serial Result", display_serial);
+        cv::imshow("OpenMP Result", display_openmp);
+
         if (cuda_available) {
-            cv::imshow("CUDA Result", cuda_result);
+            std::cout << "Displaying CUDA result (size: " << display_cuda.cols << "x" << display_cuda.rows << ")" << std::endl;
+            cv::imshow("CUDA Result", display_cuda);
+            cv::waitKey(1); // Force update
         }
 
         // First wait for key in OpenCV window (this won't block the return to menu)
@@ -336,7 +428,7 @@ int main(int argc, char** argv) {
             std::cerr << "Some features may be unavailable." << std::endl;
         }
 
-        std::string project_path = "./";//"C:/Users/esther/source/repos/Dehaze/";
+        std::string project_path = "./";
 
         // Check for command-line arguments
         bool interactive_mode = true;
